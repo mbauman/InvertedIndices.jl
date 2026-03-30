@@ -222,8 +222,15 @@ end
 
 # Like the definition in Base, but adding support for pre-converted logical indices
 @inline index_ndims(args...) = Base.index_ndims(args...)
-@inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
-    (ntuple(x->true, Val(N))..., index_ndims(I...)...)
+if VERSION < v"1.11.0-DEV.1157"
+    # Prior to this change, we didn't properly use 0-dimensional logical indices
+    @inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
+        (ntuple(x->true, Val(max(1,N)))..., index_ndims(I...)...)
+    end
+else
+    @inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
+        (ntuple(x->true, Val(N))..., index_ndims(I...)...)
+    end
 end
 
 spanned_indices(::Tuple{}, n) = throw(AssertionError("Not enough indices to span the picks"))

@@ -177,45 +177,73 @@ uniquesort(r::AbstractRange) = step(r) > 0 ? r : step(r) == 0 ? r[end:end] : rev
 uniquesort(A::Base.LogicalIndex) = A
 uniquesort(x) = x
 
-@inline function Base.to_indices(A, inds, I::Tuple{InvertedIndex, Vararg{Any}})
+# The cartesian product of the tuple of indices, like CartesianIndices but with
+# support for integers, arbitrary vectors, and heterogeneous mixtures thereof
+# The vectors must be sorted for use in an InvertedIndexIterator
+struct CartesianIndexArray{M,N,X} <: AbstractArray{CartesianIndex{M},N}
+    tup::X
+end
+Base.axes(ca::CartesianIndexArray) = Base.index_shape(ca.tup...)
+Base.size(ca::CartesianIndexArray) = map(length, Base.index_shape(ca.tup...))
+@inline function Base.getindex(ca::CartesianIndexArray{<:Any,N}, I::Vararg{Int, N}) where {N}
+    @boundscheck checkbounds(ca, I...)
+    CartesianIndex(reindex(ca.tup, I))
+end
+
+cartesian(tup) = CartesianIndexArray{length(tup), length(Base.index_shape(tup...)), typeof(tup)}(tup)
+cartesian(tup::Tuple{Vararg{AbstractUnitRange}}) = CartesianIndices(tup)
+
+@inline reindex(tup::Tuple{<:AbstractVector, Vararg{Any}}, I) = (tup[1][I[1]], reindex(tail(tup), Base.safe_tail(I))...)
+reindex(::Tuple{<:AbstractArray, Vararg{Any}}, I) = throw(AssertionError("InvertedIndex did not expect a multidimensional array within a cartesian product"))
+@inline reindex(tup::Tuple{Any, Vararg{Any}}, I) = (tup[1], reindex(tail(tup), I)...)
+reindex(::Tuple{}, I) = ()
+
+function Base.to_indices(A, inds, I::Tuple{InvertedIndex, Vararg{Any}})
     new_indices = to_indices(A, inds, (I[1].skip, tail(I)...))
-    skips = uniquesort(new_indices[1])
-    picks = spanned_indices(inds, skips)[1]
-    return (InvertedIndexIterator(skips, picks), tail(new_indices)...)
+    # Now the hard part is connecting the picks (from inds) and skips (from new_indices)
+    # The easy one to get is the number of dimensions (axes) that the inverted index spans:
+    n_picks = index_ndims(I[1].skip)
+    picks, _ = Base.IteratorsMD.split(inds, Val(length(n_picks)))
+    # The hard one is the number of indices that we need to pull out of new_indices; we need
+    # the same `index_ndims` as the picks, but this may not be the same index _count_.
+    skips = spanned_indices(new_indices, n_picks)
+    _, tails = Base.IteratorsMD.split(new_indices, Val(length(skips)))
+    if length(picks) == length(skips) == 1
+        # The common case
+        return (InvertedIndexIterator(uniquesort(skips[1]), picks[1]), tails...)
+    elseif length(skips) == 1
+        # The picks are always tuples of AbstractUnitRanges
+        return (InvertedIndexIterator(uniquesort(skips[1]), CartesianIndices(picks)), tails...)
+    else
+        # But the skips might be a tuple of other index types
+        return (InvertedIndexIterator(cartesian(map(uniquesort, skips)), CartesianIndices(picks)), tails...)
+    end
 end
 
-struct ZeroDArray{T} <: AbstractArray{T,0}
-    x::T
-end
-Base.size(::ZeroDArray) = ()
-Base.getindex(Z::ZeroDArray) = Z.x
-
-# Be careful with CartesianIndex as they splat out to a variable number of new indices and do not iterate
-function Base.to_indices(A, inds, I::Tuple{InvertedIndex{<:CartesianIndex}, Vararg{Any}})
-    skips = ZeroDArray(I[1].skip)
-    picks, tails = spanned_indices(inds, skips)
-    return (InvertedIndexIterator(skips, picks), to_indices(A, tails, tail(I))...)
+# Like the definition in Base, but adding support for pre-converted logical indices
+@inline index_ndims(args...) = Base.index_ndims(args...)
+@inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
+    (ntuple(Returns(true), Val(N))..., index_ndims(I...)...)
 end
 
-# Either return a CartesianRange or an axis vector
-@inline spanned_indices(inds, ::Any) = inds[1], tail(inds)
-const NIdx{N} = Union{CartesianIndex{N}, AbstractArray{CartesianIndex{N}}, AbstractArray{Bool,N}}
-@inline spanned_indices(inds, ::NIdx{0}) = CartesianIndices(()), inds
-@inline spanned_indices(inds, ::NIdx{1}) = inds[1], tail(inds)
-@inline function spanned_indices(inds, ::NIdx{N}) where N
-    heads, tails = Base.IteratorsMD.split(inds, Val(N))
-    return CartesianIndices(heads), tails
+spanned_indices(::Tuple{}, n) = throw(AssertionError("Not enough indices to span the picks"))
+spanned_indices(::Tuple{}, ::Tuple{}) = ()
+function spanned_indices(inds, ::Tuple{})
+    # This is a little tricky; we need to keep pulling inds out as long as they're 0-ndim
+    i1 = inds[1]
+    dims1 = index_ndims(i1)
+    return dims1 == () ? (i1, spanned_indices(tail(inds), ())...) : ()
 end
-
-# It's possible more indices were specified than there were axes
-@inline spanned_indices(inds::Tuple{}, ::Any) = Base.OneTo(1), ()
-@inline spanned_indices(inds::Tuple{}, ::NIdx{0}) = CartesianIndices(()), ()
-@inline spanned_indices(inds::Tuple{}, ::NIdx{1}) = Base.OneTo(1), ()
-@inline spanned_indices(inds::Tuple{}, ::NIdx{N}) where N = CartesianIndices(ntuple(i->Base.OneTo(1), N)), ()
+function spanned_indices(inds, n)
+    i1 = inds[1]
+    dims1 = index_ndims(i1)
+    (i1, spanned_indices(tail(inds), Base.IteratorsMD.split(n, Val(length(dims1)))[2])...)
+end
 
 # This is an interesting need — we need this because otherwise indexing with a
 # single multidimensional boolean array ends up comparing a multidimensional cartesian
 # index to a linear index.
+const NIdx{N} = Union{CartesianIndex{N}, AbstractArray{CartesianIndex{N}}, AbstractArray{Bool,N}}
 @inline Base.to_indices(A, I::Tuple{Not{<:NIdx{1}}}) = to_indices(A, (eachindex(IndexLinear(), A),), I)
 @inline Base.to_indices(A, I::Tuple{Not{<:NIdx}}) = to_indices(A, axes(A), I)
 if VERSION < v"1.11.0-DEV.1157"

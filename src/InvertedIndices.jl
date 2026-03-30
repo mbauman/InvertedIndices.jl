@@ -183,8 +183,8 @@ uniquesort(x) = x
 struct CartesianIndexArray{M,N,X} <: AbstractArray{CartesianIndex{M},N}
     tup::X
 end
-Base.axes(ca::CartesianIndexArray) = Base.index_shape(ca.tup...)
-Base.size(ca::CartesianIndexArray) = map(length, Base.index_shape(ca.tup...))
+@inline Base.axes(ca::CartesianIndexArray) = Base.index_shape(ca.tup...)
+@inline Base.size(ca::CartesianIndexArray) = map(length, Base.index_shape(ca.tup...))
 @inline function Base.getindex(ca::CartesianIndexArray{<:Any,N}, I::Vararg{Int, N}) where {N}
     @boundscheck checkbounds(ca, I...)
     CartesianIndex(reindex(ca.tup, I))
@@ -223,18 +223,18 @@ end
 # Like the definition in Base, but adding support for pre-converted logical indices
 @inline index_ndims(args...) = Base.index_ndims(args...)
 @inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
-    (ntuple(Returns(true), Val(N))..., index_ndims(I...)...)
+    (ntuple(x->true, Val(N))..., index_ndims(I...)...)
 end
 
 spanned_indices(::Tuple{}, n) = throw(AssertionError("Not enough indices to span the picks"))
 spanned_indices(::Tuple{}, ::Tuple{}) = ()
-function spanned_indices(inds, ::Tuple{})
+@inline function spanned_indices(inds, ::Tuple{})
     # This is a little tricky; we need to keep pulling inds out as long as they're 0-ndim
     i1 = inds[1]
     dims1 = index_ndims(i1)
     return dims1 == () ? (i1, spanned_indices(tail(inds), ())...) : ()
 end
-function spanned_indices(inds, n)
+@inline function spanned_indices(inds, n)
     i1 = inds[1]
     dims1 = index_ndims(i1)
     (i1, spanned_indices(tail(inds), Base.IteratorsMD.split(n, Val(length(dims1)))[2])...)

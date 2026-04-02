@@ -2,8 +2,7 @@ using InvertedIndices
 using Test
 using OffsetArrays
 
-@testset "0-d" begin
-    A = fill(1)
+@testset "0-d" for A in (fill(1), view([1], fill(1)), reshape(view([1], 1), ()))
     @test A[Not(fill(A.==1))] == []
     @test A[Not(CartesianIndex())] == []
     @test A[Not(CartesianIndices(()))] == []

@@ -198,15 +198,21 @@ reindex(::Tuple{<:AbstractArray, Vararg{Any}}, I) = throw(AssertionError("Invert
 @inline reindex(tup::Tuple{Any, Vararg{Any}}, I) = (tup[1], reindex(tail(tup), I)...)
 reindex(::Tuple{}, I) = ()
 
+@inline take_n_axes(A, inds::Tuple, n::Tuple) = take_n_axes(A, 1, inds, n)
+@inline take_n_axes(A, i, inds::Tuple, n::Tuple) = (inds[1], take_n_axes(A, i, tail(inds), tail(n))...)
+@inline take_n_axes(A, i, ::Tuple{}, n::Tuple) = (axes(A, ndims(A)+i), take_n_axes(A, i+1, (), tail(n))...)
+take_n_axes(A, i, ::Tuple, ::Tuple{}) = ()
+take_n_axes(A, i, ::Tuple{}, ::Tuple{}) = ()
+
 function Base.to_indices(A, inds, I::Tuple{InvertedIndex, Vararg{Any}})
     new_indices = to_indices(A, inds, (I[1].skip, tail(I)...))
     # Now the hard part is connecting the picks (from inds) and skips (from new_indices)
     # The easy one to get is the number of dimensions (axes) that the inverted index spans:
-    n_picks = index_ndims(I[1].skip)
-    picks, _ = Base.IteratorsMD.split(inds, Val(length(n_picks)))
+    n_picks = index_ndims(A, I[1].skip)
+    picks = take_n_axes(A, inds, n_picks)
     # The hard one is the number of indices that we need to pull out of new_indices; we need
     # the same `index_ndims` as the picks, but this may not be the same index _count_.
-    skips = spanned_indices(new_indices, n_picks)
+    skips = spanned_indices(A, new_indices, n_picks)
     _, tails = Base.IteratorsMD.split(new_indices, Val(length(skips)))
     if length(picks) == length(skips) == 1
         # The common case
@@ -220,31 +226,18 @@ function Base.to_indices(A, inds, I::Tuple{InvertedIndex, Vararg{Any}})
     end
 end
 
-# Like the definition in Base, but adding support for pre-converted logical indices
-@inline index_ndims(args...) = Base.index_ndims(args...)
-if VERSION < v"1.11.0-DEV.1157"
-    # Prior to this change, we didn't properly use 0-dimensional logical indices
-    @inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
-        (ntuple(x->true, Val(max(1,N)))..., index_ndims(I...)...)
-    end
-else
-    @inline function index_ndims(i1::AbstractArray{Bool, N}, I...) where N
-        (ntuple(x->true, Val(N))..., index_ndims(I...)...)
-    end
-end
-
-spanned_indices(::Tuple{}, n) = throw(AssertionError("Not enough indices to span the picks"))
-spanned_indices(::Tuple{}, ::Tuple{}) = ()
-@inline function spanned_indices(inds, ::Tuple{})
+spanned_indices(A, ::Tuple{}, n) = throw(AssertionError("Not enough indices to span the picks"))
+spanned_indices(A, ::Tuple{}, ::Tuple{}) = ()
+@inline function spanned_indices(A, inds, ::Tuple{})
     # This is a little tricky; we need to keep pulling inds out as long as they're 0-ndim
     i1 = inds[1]
-    dims1 = index_ndims(i1)
-    return dims1 == () ? (i1, spanned_indices(tail(inds), ())...) : ()
+    dims1 = index_ndims(A, i1)
+    return dims1 == () ? (i1, spanned_indices(A, tail(inds), ())...) : ()
 end
-@inline function spanned_indices(inds, n)
+@inline function spanned_indices(A, inds, n)
     i1 = inds[1]
-    dims1 = index_ndims(i1)
-    (i1, spanned_indices(tail(inds), Base.IteratorsMD.split(n, Val(length(dims1)))[2])...)
+    dims1 = index_ndims(A, i1)
+    (i1, spanned_indices(A, tail(inds), Base.IteratorsMD.split(n, Val(length(dims1)))[2])...)
 end
 
 # This is an interesting need — we need this because otherwise indexing with a
@@ -253,11 +246,28 @@ end
 const NIdx{N} = Union{CartesianIndex{N}, AbstractArray{CartesianIndex{N}}, AbstractArray{Bool,N}}
 @inline Base.to_indices(A, I::Tuple{Not{<:NIdx{1}}}) = to_indices(A, (eachindex(IndexLinear(), A),), I)
 @inline Base.to_indices(A, I::Tuple{Not{<:NIdx}}) = to_indices(A, axes(A), I)
+
+# The number of dimensions that an index spans is tricky due to historical bad behavior of
+# logical indices. In Julias 1.10 and before, the behavior of a logical index depends upon
+# three things: (1) if it's the only index and (2) the IndexStyle of the parent and (3) the index type
+# After 1.10, the behaviors no longer depend on (1) and (2), and we could remove the A argument
+index_ndims(A, indices...) = _index_ndims(indices...)
+_index_ndims() = ()
+_index_ndims(i1::NIdx{N}, I...) where {N} = (ntuple(x->true, Val(N))..., _index_ndims(I...)...)
+_index_ndims(i1, I...) = (true, _index_ndims(I...)...)
 if VERSION < v"1.11.0-DEV.1157"
-    # Arrays of Bool are even more confusing as they're sometimes linear and sometimes not
+    # Arrays of Bool are even more confusing as they're sometimes linear and sometimes not...
+    # and worse, it depends upon the _parent_ being indexed into
     # This was addressed in Base with JuliaLang/julia#45869.
-    @inline Base.to_indices(A, I::Tuple{Not{<:AbstractArray{Bool, 1}}}) = to_indices(A, (eachindex(IndexLinear(), A),), I)
-    @inline Base.to_indices(A, I::Tuple{Not{<:Union{Array{Bool}, BitArray}}}) = to_indices(A, (eachindex(A),), I)
+    @inline Base.to_indices(A, I::Tuple{Not{<:AbstractArray{Bool, 1}}}) =
+        to_indices(A, (eachindex(IndexLinear(), A),), I)
+    @inline Base.to_indices(A, I::Tuple{Not{<:Union{Array{Bool}, BitArray}}}) =
+        to_indices(A, (IndexStyle(A) isa IndexLinear ? (eachindex(A),) : axes(A)), I)
+    # This also affects the _number_ of dimensions that these logical indices span, but only
+    # when it's the only index
+    index_ndims(A, i1::AbstractArray{Bool, 1}) = (true,)
+    index_ndims(A, i1::Union{Array{Bool}, BitArray}) =
+        IndexStyle(A) isa IndexLinear ? (true,) : ntuple(x->true, Val(ndims(i1)))
 end
 
 # a cleaner implementation is nt[filter(∉(I.skip), keys(nt))] instead of Base.structdiff, but this would only work on Julia 1.7+
